@@ -36,11 +36,28 @@ def fetch():
     raise ValueError('Unexpected trade API response')
 
 def trade_key(t):
-    # Include fill attributes: a transaction hash can cover more than one fill.
-    fields = {k:t.get(k) for k in ('transactionHash','id','asset','conditionId','side','price','size','timestamp','outcome','logIndex')}
-    return hashlib.sha256(json.dumps(fields, sort_keys=True, default=str).encode()).hexdigest()
+    fields = {
+        k: t.get(k)
+        for k in (
+            'transaction_hash',
+            'token_id',
+            'condition_id',
+            'side',
+            'price',
+            'size',
+            'timestamp',
+            'outcome',
+        )
+    }
+    return hashlib.sha256(
+        json.dumps(fields, sort_keys=True, default=str).encode()
+    ).hexdigest()
 
-def market_key(t): return str(t.get('asset') or (str(t.get('conditionId','')) + ':' + str(t.get('outcome',''))))
+def market_key(t):
+    return str(t.get('token_id') or (
+        str(t.get('condition_id', '')) + ':' +
+        str(t.get('outcome', ''))
+    ))
 
 def init():
     parent = os.path.dirname(DB_PATH)
