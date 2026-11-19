@@ -1,198 +1,290 @@
-"""Independent A/B PAPER simulator. Never places real orders."""
-import datetime as dt
+"""Read-only market data and two independent paper ledgers."""
 import hashlib
 import json
 import os
 import sqlite3
 import time
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from decimal import Decimal
+
 import requests
 
 WALLET = "0xf0318c32136c2db7fec88b84869aee6a1106c80c"
-API = "https://data-api.polymarket.com/v2/trades"
-DB = os.getenv("AB_DB_PATH", "/data/portfolios_ab.sqlite3")
+TRADES = "https://data-api.polymarket.com/v2/trades"
+MARKETS = "https://clob.polymarket.com/markets/"
 START = Decimal("1000")
-SOURCE_BANKROLL = Decimal(os.getenv("AB_SOURCE_BANKROLL", "1000000"))
-EQUAL_BUY = Decimal(os.getenv("AB_EQUAL_BUY", "10"))
-CAP = Decimal(os.getenv("AB_MARKET_CAP", "100"))
-POLL = max(10, int(os.getenv("AB_POLL_SECONDS", "30")))
-DURATION = int(os.getenv("AB_HOURS", "72"))
-SUMMARY = int(os.getenv("AB_SUMMARY_HOURS", "12"))
-MAX_PAGES = max(1, int(os.getenv("AB_MAX_PAGES", "30")))
-UTC = dt.timezone.utc
+ZERO = Decimal("0")
+DELAY = 120
+OVERLAP = 3600
 
-def clock():
-    return dt.datetime.now(UTC)
 
-def dec(value):
-    try:
-        return Decimal(str(value))
-    except Exception:
-        return Decimal("0")
+@dataclass(frozen=True)
+class Trade:
+    id: str
+    timestamp: int
+    condition: str
+    asset: str
+    side: str
+    price: Decimal
+    size: Decimal
 
-def meta(db, key, default=None):
-    row = db.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
-    return row[0] if row else default
+    @classmethod
+    def parse(cls, row):
+        stamp = Decimal(str(row["timestamp"]))
+        if stamp >= 10**12:
+            stamp /= 1000
+        if not 10**9 <= stamp < 10**10:
+            raise ValueError("Invalid trade timestamp")
+        price, size = Decimal(str(row["price"])), Decimal(str(row["size"]))
+        side = row["side"].upper()
+        tx, condition, asset = (str(row[key]).lower() for key in
+                                ("transaction_hash", "condition_id", "token_id"))
+        if (not 0 < price <= 1 or not size.is_finite() or size <= 0
+                or side not in ("BUY", "SELL") or not tx.startswith("0x")
+                or not condition.startswith("0x") or not asset.isdigit()):
+            raise ValueError("Invalid trade fields")
+        fill = next((row[key] for key in ("trade_id", "fill_id", "log_index")
+                     if row.get(key) is not None), None)
+        identity = [tx, condition, asset, side, str(price.normalize()),
+                    str(size.normalize()), fill]
+        uid = hashlib.sha256(json.dumps(identity).encode()).hexdigest()
+        return cls(uid, int(stamp), condition, asset, side, price, size)
 
-def setmeta(db, key, value):
-    db.execute("INSERT OR REPLACE INTO meta VALUES (?,?)", (key, str(value)))
 
-def trade_id(trade):
-    fields = {k: trade.get(k) for k in ("transaction_hash", "token_id", "condition_id", "side", "price", "size", "timestamp", "outcome")}
-    return hashlib.sha256(json.dumps(fields, sort_keys=True, default=str).encode()).hexdigest()
+def get_json(url, **kwargs):
+    response = requests.get(url, timeout=20, **kwargs)
+    response.raise_for_status()
+    return response.json(parse_float=Decimal)
 
-def fetch_recent():
-    """Fetch all pages until exhausted; fail closed if the page cap is reached."""
-    cursor, cursors, result = None, set(), []
-    for page in range(MAX_PAGES):
-        params = {"user": WALLET, "limit": 100}
-        if cursor:
-            params["cursor"] = cursor
-        response = requests.get(API, params=params, timeout=30)
-        response.raise_for_status()
-        obj = response.json()
-        if not isinstance(obj, dict) or not isinstance(obj.get("data"), list):
-            raise ValueError("Unexpected Polymarket response")
-        result.extend(obj["data"])
-        pagination = obj.get("pagination") or {}
-        if not pagination.get("has_more"):
-            return result
-        next_cursor = pagination.get("next_cursor")
-        if not next_cursor or next_cursor in cursors:
-            raise ValueError("Incomplete pagination; refusing to process partial batch")
-        cursors.add(next_cursor)
-        cursor = next_cursor
-    raise ValueError("Pagination exceeded AB_MAX_PAGES; no partial processing")
 
-def connect():
-    os.makedirs(os.path.dirname(DB) or ".", exist_ok=True)
-    db = sqlite3.connect(DB)
-    db.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)")
-    db.execute("CREATE TABLE IF NOT EXISTS seen (id TEXT PRIMARY KEY, timestamp INTEGER)")
-    db.execute("CREATE TABLE IF NOT EXISTS source_positions (asset TEXT PRIMARY KEY, shares TEXT)")
-    db.execute("CREATE TABLE IF NOT EXISTS positions (portfolio TEXT, asset TEXT, title TEXT, outcome TEXT, shares TEXT, cost TEXT, mark TEXT, PRIMARY KEY(portfolio,asset))")
-    db.execute("CREATE TABLE IF NOT EXISTS fills (portfolio TEXT, id TEXT, side TEXT, asset TEXT, shares TEXT, cash_delta TEXT, note TEXT, PRIMARY KEY(portfolio,id))")
-    db.commit()
+def fetch(floor, get=get_json):
+    params = {"user": WALLET, "limit": 100}
+    cursors, trades = set(), []
+    previous = None
+    for _ in range(300):
+        payload = get(TRADES, params=params.copy())
+        rows, page = payload["data"], payload["pagination"]
+        cursor = page["next_cursor"]
+        if (not isinstance(rows, list) or (not rows and cursor is not None)
+                or ("has_more" in page and page["has_more"] != (cursor is not None))):
+            raise ValueError("Inconsistent trade page")
+        for row in rows:
+            trade = Trade.parse(row)
+            if previous is not None and trade.timestamp > previous:
+                raise ValueError("Trade pages are out of order")
+            previous = trade.timestamp
+            if previous < floor:
+                return list(reversed(trades))
+            trades.append(trade)
+        if cursor is None:
+            return list(reversed(trades))
+        if not isinstance(cursor, str) or not cursor or cursor in cursors:
+            raise ValueError("Invalid or repeated trade cursor")
+        cursors.add(cursor)
+        params["cursor"] = cursor
+    raise ValueError("Trade page limit reached before checkpoint")
+
+
+def connect(path):
+    db = sqlite3.connect(path)
+    db.executescript("""
+        PRAGMA journal_mode=WAL;
+        CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value INTEGER);
+        CREATE TABLE IF NOT EXISTS accounts (name TEXT PRIMARY KEY, cash TEXT);
+        CREATE TABLE IF NOT EXISTS trades (id TEXT PRIMARY KEY, ts INTEGER, asset TEXT,
+            condition_id TEXT, side TEXT, price TEXT, size TEXT, treatment TEXT);
+        CREATE TABLE IF NOT EXISTS source (asset TEXT PRIMARY KEY, shares TEXT);
+        CREATE TABLE IF NOT EXISTS holdings (name TEXT, asset TEXT, condition_id TEXT,
+            shares TEXT, cost TEXT, proxy TEXT, PRIMARY KEY(name, asset));
+        CREATE TABLE IF NOT EXISTS ledger (name TEXT, id TEXT, kind TEXT, asset TEXT,
+            shares TEXT, cash_delta TEXT, realized TEXT, PRIMARY KEY(name,id));
+        CREATE TABLE IF NOT EXISTS resolved (condition_id TEXT PRIMARY KEY, winner TEXT);
+    """)
     return db
 
-def cash(db, portfolio):
-    return dec(meta(db, "cash_" + portfolio, START))
 
-def source_shares(db, asset):
-    row = db.execute("SELECT shares FROM source_positions WHERE asset=?", (asset,)).fetchone()
-    return dec(row[0]) if row else Decimal("0")
+def setting(db, key, default=None):
+    row = db.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+    return row[0] if row else default
 
-def process(db, trade):
-    side = str(trade.get("side", "")).upper()
-    asset = str(trade.get("token_id") or "")
-    price = dec(trade.get("price"))
-    qty = dec(trade.get("size"))
-    if not asset or side not in ("BUY", "SELL") or not (0 < price < 1) or qty <= 0:
+
+def save(db, key, value):
+    db.execute("INSERT OR REPLACE INTO settings VALUES (?,?)", (key, value))
+
+
+def record(db, name, uid, kind, asset, quantity, delta, realized):
+    cash = Decimal(db.execute("SELECT cash FROM accounts WHERE name=?", (name,)).fetchone()[0])
+    db.execute("UPDATE accounts SET cash=? WHERE name=?", (str(cash + delta), name))
+    db.execute("INSERT INTO ledger VALUES (?,?,?,?,?,?,?)",
+               (name, uid, kind, asset, str(quantity), str(delta), str(realized)))
+
+
+def apply(db, trade):
+    source = db.execute("SELECT shares FROM source WHERE asset=?", (trade.asset,)).fetchone()
+    before = Decimal(source[0]) if source else ZERO
+    buy = trade.side == "BUY"
+    after = before + trade.size if buy else max(ZERO, before - trade.size)
+    fraction = min(Decimal(1), trade.size / before) if not buy and before else ZERO
+    db.execute("INSERT OR REPLACE INTO source VALUES (?,?)", (trade.asset, str(after)))
+    for name, cash in db.execute("SELECT name,cash FROM accounts ORDER BY name").fetchall():
+        row = db.execute("SELECT shares,cost FROM holdings WHERE name=? AND asset=?",
+                         (name, trade.asset)).fetchone()
+        shares, cost = map(Decimal, row) if row else (ZERO, ZERO)
+        if buy:
+            spend = trade.size * trade.price / 1000 if name == "A" else Decimal("10")
+            if spend > Decimal(cash):
+                continue
+            quantity, delta, released = spend / trade.price, -spend, ZERO
+            shares += quantity
+            cost += spend
+        elif shares and fraction:
+            quantity = shares * fraction
+            released = cost * fraction
+            delta = quantity * trade.price
+            shares -= quantity
+            cost -= released
+        else:
+            continue
+        record(db, name, trade.id, trade.side, trade.asset, quantity, delta,
+               ZERO if buy else delta - released)
+        if shares:
+            db.execute("INSERT OR REPLACE INTO holdings VALUES (?,?,?,?,?,?)",
+                       (name, trade.asset, trade.condition, str(shares), str(cost), str(trade.price)))
+        else:
+            db.execute("DELETE FROM holdings WHERE name=? AND asset=?", (name, trade.asset))
+
+
+def ingest(db, now, get=get_json):
+    baseline = setting(db, "baseline")
+    if baseline is None:
+        # Probe the live feed before initializing. Start at the time of this request.
+        get(TRADES, params={"user": WALLET, "limit": 2})["pagination"]["next_cursor"]
+        with db:
+            db.executemany("INSERT INTO accounts VALUES (?,?)", [("A", str(START)), ("B", str(START))])
+            for key in ("baseline", "checkpoint", "last_report"):
+                save(db, key, now)
+        return "baseline initialized"
+    checkpoint = setting(db, "checkpoint")
+    cutoff = now - DELAY
+    if cutoff <= checkpoint:
+        return "waiting for indexing delay"
+    rows = fetch(max(baseline + 1, checkpoint - OVERLAP), get)
+    count = 0
+    with db:
+        for trade in rows:
+            if trade.timestamp > cutoff:
+                continue
+            if db.execute("SELECT 1 FROM trades WHERE id=?", (trade.id,)).fetchone():
+                continue
+            if trade.timestamp <= checkpoint:
+                raise ValueError(f"Late unseen trade at {trade.timestamp}; checkpoint {checkpoint}")
+            closed = db.execute("SELECT 1 FROM resolved WHERE condition_id=?",
+                                (trade.condition,)).fetchone()
+            if closed:
+                raise ValueError(f"Trade arrived after settlement for {trade.condition}")
+            db.execute("INSERT INTO trades VALUES (?,?,?,?,?,?,?,?)",
+                       (trade.id, trade.timestamp, trade.asset, trade.condition, trade.side,
+                        str(trade.price), str(trade.size), "observed"))
+            apply(db, trade)
+            db.execute("UPDATE holdings SET proxy=? WHERE asset=?", (str(trade.price), trade.asset))
+            count += 1
+        save(db, "checkpoint", cutoff)
+    pending = {trade.condition for trade in rows if trade.timestamp > cutoff}
+    return f"feed checked; {count} new trades", pending
+
+
+def settlement_winner(market, condition):
+    if market.get("condition_id") != condition or market.get("closed") is not True:
+        return None
+    tokens = market["tokens"]
+    if len(tokens) != 2 or any(type(token.get("winner")) is not bool for token in tokens):
+        return None
+    winners = [str(token["token_id"]) for token in tokens if token["winner"]]
+    return winners[0] if len(winners) == 1 else None
+
+
+def settle(db, market, condition):
+    winner = settlement_winner(market, condition)
+    if winner is None:
         return
-    source_before = source_shares(db, asset)
-    fraction = min(Decimal("1"), qty / source_before) if side == "SELL" and source_before else Decimal("0")
-    source_after = source_before + qty if side == "BUY" else max(Decimal("0"), source_before - qty)
-    db.execute("INSERT OR REPLACE INTO source_positions VALUES (?,?)", (asset, str(source_after)))
-    uid = trade_id(trade)
-    title = str(trade.get("title") or "Unknown")
-    outcome = str(trade.get("outcome") or "?")
-    for portfolio in ("A", "B"):
-        row = db.execute("SELECT shares,cost FROM positions WHERE portfolio=? AND asset=?", (portfolio, asset)).fetchone()
-        shares, cost = (dec(row[0]), dec(row[1])) if row else (Decimal("0"), Decimal("0"))
-        delta, fill, note = Decimal("0"), Decimal("0"), ""
-        if side == "BUY":
-            desired = qty * price * START / SOURCE_BANKROLL if portfolio == "A" else EQUAL_BUY
-            spend = min(desired, max(Decimal("0"), CAP-cost), cash(db, portfolio))
-            if spend > 0:
-                fill = spend / price
-                shares += fill
-                cost += spend
-                delta = -spend
-            else:
-                note = "No cash or market capacity"
-        else:
-            fill = shares * fraction
-            if fill > 0:
-                avg_cost = cost / shares
-                shares -= fill
-                cost -= avg_cost * fill
-                delta = fill * price
-            else:
-                note = "No eligible source-matched holding"
-        if shares <= Decimal("0.000000001"):
-            db.execute("DELETE FROM positions WHERE portfolio=? AND asset=?", (portfolio, asset))
-        else:
-            db.execute("INSERT OR REPLACE INTO positions VALUES (?,?,?,?,?,?,?)",
-                       (portfolio, asset, title, outcome, str(shares), str(max(cost, Decimal("0"))), str(price)))
-        if delta:
-            setmeta(db, "cash_" + portfolio, cash(db, portfolio) + delta)
-        db.execute("INSERT OR IGNORE INTO fills VALUES (?,?,?,?,?,?,?)",
-                   (portfolio, uid, side, asset, str(fill), str(delta), note))
+    assets = {str(token["token_id"]) for token in market["tokens"]}
+    held = {row[0] for row in db.execute(
+        "SELECT DISTINCT asset FROM holdings WHERE condition_id=?", (condition,))}
+    if len(assets) != 2 or not held <= assets:
+        raise ValueError("Resolution tokens do not match holdings")
+    with db:
+        if not db.execute("INSERT OR IGNORE INTO resolved VALUES (?,?)",
+                          (condition, winner)).rowcount:
+            return
+        for name, asset, shares, cost in db.execute(
+                "SELECT name,asset,shares,cost FROM holdings WHERE condition_id=?", (condition,)).fetchall():
+            shares, cost = Decimal(shares), Decimal(cost)
+            payout = shares if asset == winner else ZERO
+            record(db, name, f"settle:{condition}:{asset}", "SETTLE", asset, shares, payout, payout - cost)
+        db.execute("DELETE FROM holdings WHERE condition_id=?", (condition,))
+
 
 def report(db):
-    lines = ["A/B PAPER ONLY — proxy trade marks; no fees, slippage or settlements"]
-    for portfolio in ("A", "B"):
-        marked = sum((dec(sh) * dec(price) for sh, price in db.execute(
-            "SELECT shares,mark FROM positions WHERE portfolio=?", (portfolio,))), Decimal("0"))
-        available = cash(db, portfolio)
-        equity = available + marked
-        count = db.execute("SELECT COUNT(*) FROM fills WHERE portfolio=? AND shares!='0'", (portfolio,)).fetchone()[0]
-        lines.append(f"{portfolio}: cash ${available:.2f} | proxy equity ${equity:.2f} | P/L ${equity-START:+.2f} | fills {count}")
+    started = datetime.fromtimestamp(setting(db, "baseline"), timezone.utc)
+    observed = db.execute("SELECT count(*) FROM trades").fetchone()[0]
+    lines = [f"A/B paper only | since {started.isoformat()} | {observed} observed trades"]
+    for name, cash in db.execute("SELECT name,cash FROM accounts ORDER BY name"):
+        cash = Decimal(cash)
+        holdings = db.execute("SELECT shares,cost,proxy FROM holdings WHERE name=?", (name,)).fetchall()
+        cost = sum((Decimal(row[1]) for row in holdings), ZERO)
+        proxy = sum((Decimal(shares) * Decimal(mark) for shares, _, mark in holdings), ZERO)
+        realized = cash + cost - START
+        counts = dict(db.execute("SELECT kind,count(*) FROM ledger WHERE name=? GROUP BY kind", (name,)))
+        lines.append(f"{name} | cash ${cash:.2f} | realized paper P&L ${realized:+.2f} | "
+                     f"{len(holdings)} open at cost ${cost:.2f} | open proxy value ${proxy:.2f} | "
+                     f"buys {counts.get('BUY',0)}, sells {counts.get('SELL',0)}, settlements {counts.get('SETTLE',0)}")
     return "\n".join(lines)
 
+
 def notify(message):
-    print(message, flush=True)
     token, chat = os.getenv("TELEGRAM_BOT_TOKEN"), os.getenv("TELEGRAM_CHAT_ID")
-    if token and chat:
+    if not token or not chat or token.startswith("${{") or chat.startswith("${{"):
+        return False
+    try:
         response = requests.post(f"https://api.telegram.org/bot{token}/sendMessage",
                                  json={"chat_id": chat, "text": message}, timeout=15)
-        response.raise_for_status()
+        return response.ok and response.json().get("ok") is True
+    except (requests.RequestException, ValueError):
+        return False
 
-def tick(db):
-    rows = fetch_recent()
-    if meta(db, "baseline_complete") != "yes":
-        # The initial snapshot is a baseline, not a source of live simulated orders.
-        for trade in rows:
-            db.execute("INSERT OR IGNORE INTO seen VALUES (?,?)", (trade_id(trade), int(trade.get("timestamp") or 0)))
-        started = clock()
-        setmeta(db, "started_at", started.isoformat())
-        setmeta(db, "last_summary", started.isoformat())
-        for portfolio in ("A", "B"):
-            setmeta(db, "cash_" + portfolio, START)
-        setmeta(db, "baseline_complete", "yes")
-        db.commit()
-        notify(f"A/B baseline ready: {len(rows)} historical trades ignored. Both portfolios start at $1000 PAPER cash.")
-        return
-    started = dt.datetime.fromisoformat(meta(db, "started_at"))
-    active = (clock() - started).total_seconds() < DURATION * 3600
-    # Only act on trades executed after the baseline timestamp.
-    for trade in sorted(rows, key=lambda x: int(x.get("timestamp") or 0)):
-        uid = trade_id(trade)
-        timestamp = int(trade.get("timestamp") or 0)
-        fresh = db.execute("INSERT OR IGNORE INTO seen VALUES (?,?)", (uid, timestamp)).rowcount
-        if fresh and active and timestamp > int(started.timestamp()):
-            process(db, trade)
-    db.commit()
-    last = dt.datetime.fromisoformat(meta(db, "last_summary"))
-    if (clock() - last).total_seconds() >= SUMMARY * 3600:
-        notify(report(db))
-        setmeta(db, "last_summary", clock().isoformat())
-        db.commit()
-    if not active and meta(db, "finished") != "yes":
-        notify("A/B PAPER EXPERIMENT COMPLETE\n" + report(db))
-        setmeta(db, "finished", "yes")
-        db.commit()
 
 def main():
-    if SOURCE_BANKROLL <= 0 or EQUAL_BUY <= 0 or CAP <= 0:
-        raise ValueError("Sizing parameters must be positive")
-    db = connect()
+    mount = os.getenv("RAILWAY_VOLUME_MOUNT_PATH")
+    if os.getenv("RAILWAY_ENVIRONMENT_ID") and (mount != "/data" or not os.path.ismount(mount)):
+        raise RuntimeError("A/B requires its own mounted Railway volume at /data")
+    db = connect(os.path.join(mount or ".", "breakthebank_ab.sqlite3"))
+    next_settle = 0
     while True:
+        now = int(time.time())
         try:
-            tick(db)
-        except Exception as exc:
-            print("A/B ERROR:", repr(exc), flush=True)
-        time.sleep(POLL)
+            state = ingest(db, now)
+            print(state[0] if isinstance(state, tuple) else state, flush=True)
+            if isinstance(state, tuple) and now >= next_settle:
+                conditions = db.execute("SELECT DISTINCT condition_id FROM holdings").fetchall()
+                # Check only when the condition has no trades pending through the safety delay.
+                for (condition,) in conditions:
+                    if condition not in state[1]:
+                        try:
+                            settle(db, get_json(MARKETS + condition), condition)
+                        except (requests.RequestException, ValueError, KeyError):
+                            print(f"Settlement lookup unavailable for {condition}", flush=True)
+                next_settle = now + 900
+            if state == "baseline initialized" or now - setting(db, "last_report") >= 86400:
+                message = report(db)
+                print(message, flush=True)
+                print("Telegram digest delivered" if notify(message) else "Telegram digest unavailable", flush=True)
+                with db:
+                    save(db, "last_report", now)
+        except (requests.RequestException, ValueError, KeyError, ArithmeticError) as exc:
+            print(f"A/B ingestion or data error: {exc}", flush=True)
+        time.sleep(30)
+
 
 if __name__ == "__main__":
     main()
